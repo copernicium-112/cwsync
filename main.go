@@ -163,6 +163,10 @@ func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig,
 	OffsetPath := service.ConsulKVPath + "/" + logStreamName
 	lastTimestamp := loadOffsetFromConsul(consulClient, OffsetPath, OffsetFallbackDuration)
 	InfoLogger.Printf("Starting to tail log stream %s from timestamp %d", logStreamName, lastTimestamp)
+	retryDelay := 10 * time.Second
+	maxRetryDelay := 5 * time.Minute
+
+	var nextToken *string
 
 	for {
 		params := &cloudwatchlogs.GetLogEventsInput{
@@ -171,26 +175,40 @@ func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig,
 			StartTime:     aws.Int64(lastTimestamp),
 			StartFromHead: aws.Bool(true),
 			Limit:         aws.Int64(500),
+			NextToken:     nextToken,
 		}
 
 		resp, err := cwLogs.GetLogEvents(params)
+
 		if err != nil {
 			ErrorLogger.Printf("Error getting log events for stream %s: %v", logStreamName, err)
 			time.Sleep(60 * time.Second)
 			continue
 		}
 
-		for _, event := range resp.Events {
-			InfoLogger.Printf("[%s] %s\n", logStreamName, *event.Message)
-			lastTimestamp = *event.Timestamp
-		}
-
 		if len(resp.Events) > 0 {
+			for _, event := range resp.Events {
+				InfoLogger.Printf("[%s] %s\n", logStreamName, *event.Message)
+			}
+			lastTimestamp = *resp.Events[len(resp.Events)-1].Timestamp
 			err = saveOffsetToConsul(consulClient, OffsetPath, lastTimestamp)
 			if err != nil {
 				FatalLogger.Printf("Error saving offset to Consul: %v", err)
 			}
-			time.Sleep(10 * time.Second)
+			nextToken = resp.NextForwardToken
+			retryDelay = 10 * time.Second
+		} else {
+			if nextToken != nil && *resp.NextForwardToken == *nextToken {
+				lastTimestamp += 1
+				nextToken = nil
+			} else {
+				nextToken = resp.NextForwardToken
+				continue
+			}
+			time.Sleep(retryDelay)
+			if retryDelay < maxRetryDelay {
+				retryDelay *= 2
+			}
 		}
 	}
 }
@@ -200,7 +218,6 @@ func saveOffsetToConsul(consulClient *api.Client, kvPath string, lastTimestamp i
 		Key:   kvPath,
 		Value: []byte(fmt.Sprintf("%d", lastTimestamp)),
 	}
-	//InfoLogger.Printf("Saving offset %d to Consul", lastTimestamp)
 	_, err := consulClient.KV().Put(kvPair, nil)
 	return err
 }
@@ -212,7 +229,6 @@ func loadOffsetFromConsul(consulClient *api.Client, kvPath string, OffsetFallbac
 	}
 
 	if kvPair == nil {
-		//fmt.Println("Offset not found in Consul, using default timestamp of %s", OffsetFallbackDuration)
 		InfoLogger.Printf("Offset not found in Consul, using default timestamp of %s", OffsetFallbackDuration)
 		return time.Now().UTC().Add(-OffsetFallbackDuration).UnixMilli()
 	}
