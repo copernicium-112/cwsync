@@ -16,14 +16,21 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+var (
+	InfoLogger  *log.Logger
+	ErrorLogger *log.Logger
+	FatalLogger *log.Logger
+)
+
 type Config struct {
-	Consul       ConsulConfig    `yaml:"consul"`
-	AWSRegion    string          `yaml:"aws_region"`
-	AWSProfile   string          `yaml:"aws_profile"`
-	AWSRoleARN   string          `yaml:"aws_role_arn"`
-	AWSAccessKey string          `yaml:"aws_access_key"`
-	AWSSecretKey string          `yaml:"aws_secret_key"`
-	Services     []ServiceConfig `yaml:"services"`
+	Consul                 ConsulConfig    `yaml:"consul"`
+	AWSRegion              string          `yaml:"aws_region"`
+	AWSProfile             string          `yaml:"aws_profile"`
+	AWSRoleARN             string          `yaml:"aws_role_arn"`
+	AWSAccessKey           string          `yaml:"aws_access_key"`
+	AWSSecretKey           string          `yaml:"aws_secret_key"`
+	Services               []ServiceConfig `yaml:"services"`
+	OffsetFallbackDuration time.Duration   `yaml:"offset_fallback_duration"`
 }
 
 type ConsulConfig struct {
@@ -49,10 +56,21 @@ type Destination struct {
 	FileName string `yaml:"file_name"`
 }
 
+func init() {
+	InfoLogger = log.New(os.Stdout, "", log.Ldate|log.Ltime)
+	ErrorLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
+	FatalLogger = log.New(os.Stderr, "", log.Ldate|log.Ltime)
+}
+
 func main() {
-	config := loadConfig("config.yaml")
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config.yaml"
+	}
+	config := loadConfig(configPath)
 	sess := createAWSSession(config)
 	consulClient := setupConsulClient(config.Consul)
+	OffsetFallbackDuration := config.OffsetFallbackDuration
 
 	for _, service := range config.Services {
 		cwLogs := cloudwatchlogs.New(sess)
@@ -60,11 +78,11 @@ func main() {
 		for _, logConfig := range service.LogConfigs {
 			logStreams, err := listLogStreams(cwLogs, logConfig.LogGroupName, logConfig.LogStreamPrefix)
 			if err != nil {
-				log.Fatalf("failed to list log streams for %s: %v", service.Name, err)
+				FatalLogger.Fatalf("failed to list log streams for %s: %v", service.Name, err)
 			}
 
 			for _, stream := range logStreams {
-				go tailLogStream(cwLogs, service, logConfig, stream, consulClient)
+				go tailLogStream(cwLogs, service, logConfig, stream, consulClient, OffsetFallbackDuration)
 			}
 		}
 	}
@@ -75,12 +93,12 @@ func main() {
 func loadConfig(path string) Config {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("failed to read config file: %v", err)
+		FatalLogger.Fatalf("failed to read config file: %v", err)
 	}
 
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
-		log.Fatalf("failed to unmarshal config: %v", err)
+		FatalLogger.Fatalf("failed to unmarshal config file: %v", err)
 	}
 	return config
 }
@@ -91,7 +109,7 @@ func setupConsulClient(consulConfig ConsulConfig) *api.Client {
 	config.Token = consulConfig.Token
 	client, err := api.NewClient(config)
 	if err != nil {
-		log.Fatalf("failed to create consul client: %v", err)
+		FatalLogger.Fatalf("failed to create Consul client: %v", err)
 	}
 	return client
 }
@@ -115,7 +133,7 @@ func createAWSSession(config Config) *session.Session {
 			config.AWSSecretKey, "",
 		)
 	} else {
-		log.Fatalf("No proper AWS creds provided")
+		sessOptions.SharedConfigState = session.SharedConfigEnable
 	}
 
 	return session.Must(session.NewSessionWithOptions(sessOptions))
@@ -141,9 +159,10 @@ func listLogStreams(cwLogs *cloudwatchlogs.CloudWatchLogs, logGroupName, logStre
 	return logStreams, nil
 }
 
-func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig, logConfig LogConfig, logStreamName string, consulClient *api.Client) {
+func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig, logConfig LogConfig, logStreamName string, consulClient *api.Client, OffsetFallbackDuration time.Duration) {
 	OffsetPath := service.ConsulKVPath + "/" + logStreamName
-	lastTimestamp := loadOffsetFromConsul(consulClient, OffsetPath)
+	lastTimestamp := loadOffsetFromConsul(consulClient, OffsetPath, OffsetFallbackDuration)
+	InfoLogger.Printf("Starting to tail log stream %s from timestamp %d", logStreamName, lastTimestamp)
 
 	for {
 		params := &cloudwatchlogs.GetLogEventsInput{
@@ -151,27 +170,28 @@ func tailLogStream(cwLogs *cloudwatchlogs.CloudWatchLogs, service ServiceConfig,
 			LogStreamName: aws.String(logStreamName),
 			StartTime:     aws.Int64(lastTimestamp),
 			StartFromHead: aws.Bool(true),
-			Limit:         aws.Int64(100),
+			Limit:         aws.Int64(500),
 		}
 
 		resp, err := cwLogs.GetLogEvents(params)
 		if err != nil {
-			log.Printf("Error getting log events for stream %s: %v", logStreamName, err)
-			time.Sleep(15 * time.Second)
+			ErrorLogger.Printf("Error getting log events for stream %s: %v", logStreamName, err)
+			time.Sleep(60 * time.Second)
 			continue
 		}
 
 		for _, event := range resp.Events {
-			fmt.Printf("[%s] %s\n", logStreamName, *event.Message)
+			InfoLogger.Printf("[%s] %s\n", logStreamName, *event.Message)
 			lastTimestamp = *event.Timestamp
 		}
 
 		if len(resp.Events) > 0 {
-			time.Sleep(5 * time.Second)
-			saveOffsetToConsul(consulClient, OffsetPath, lastTimestamp)
+			err = saveOffsetToConsul(consulClient, OffsetPath, lastTimestamp)
+			if err != nil {
+				FatalLogger.Printf("Error saving offset to Consul: %v", err)
+			}
+			time.Sleep(10 * time.Second)
 		}
-
-		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -180,18 +200,22 @@ func saveOffsetToConsul(consulClient *api.Client, kvPath string, lastTimestamp i
 		Key:   kvPath,
 		Value: []byte(fmt.Sprintf("%d", lastTimestamp)),
 	}
+	//InfoLogger.Printf("Saving offset %d to Consul", lastTimestamp)
 	_, err := consulClient.KV().Put(kvPair, nil)
 	return err
 }
 
-func loadOffsetFromConsul(consulClient *api.Client, kvPath string) int64 {
+func loadOffsetFromConsul(consulClient *api.Client, kvPath string, OffsetFallbackDuration time.Duration) int64 {
 	kvPair, _, err := consulClient.KV().Get(kvPath, nil)
-	if err != nil || kvPair == nil {
-		fmt.Printf("Failed to load offset from consul or offset not found: %v\n", err)
-		return 0
+	if err != nil {
+		FatalLogger.Fatalf("Failed to load offset from Consul: %v", err)
 	}
 
+	if kvPair == nil {
+		//fmt.Println("Offset not found in Consul, using default timestamp of %s", OffsetFallbackDuration)
+		InfoLogger.Printf("Offset not found in Consul, using default timestamp of %s", OffsetFallbackDuration)
+		return time.Now().UTC().Add(-OffsetFallbackDuration).UnixMilli()
+	}
 	var lastTimestamp int64
-	fmt.Sscanf(string(kvPair.Value), "%d", &lastTimestamp)
 	return lastTimestamp
 }
