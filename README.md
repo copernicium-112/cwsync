@@ -91,13 +91,13 @@ Installation
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/cloudwatch-log-exporter.git
-   cd cloudwatch-log-exporter
+   git clone https://github.com/copernicium-112/cwsync.git
+   cd cwsync
    ```
 
 2. Build the application:
    ```bash
-   go build -o cloudwatch-log-exporter main.go
+   go build -o cwsync main.go
    ```
 
 ### configuration setup
